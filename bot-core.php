@@ -1,205 +1,210 @@
 <?php
-// Общий «движок» бота @ziptron_rent_bot: конфиг + функции + обработчик апдейта.
-// Используется и вебхуком (bot.php), и опросом (bot-poll.php).
+// Ядро бота @ziptron_rent_bot — служба поддержки (Этап 1).
+// Аренда → лид в Битрикс. Поддержка/менеджер/юр → пересылка в админ-группу (двусторонний чат). Рабочие часы.
 declare(strict_types=1);
 
 $botCfg = __DIR__ . '/bot-config.php';
 if (is_file($botCfg)) { require_once $botCfg; }
-$siteCfg = __DIR__ . '/telegram-config.php';   // отсюда берём вебхук Битрикса (как у формы сайта)
+$siteCfg = __DIR__ . '/telegram-config.php';
 if (is_file($siteCfg)) { require_once $siteCfg; }
 
-$GLOBALS['BOT_TOKEN']    = defined('ZIPTRON_BOT_TOKEN') ? ZIPTRON_BOT_TOKEN : '';
-$GLOBALS['BITRIX']       = defined('BITRIX_WEBHOOK_URL') ? rtrim((string) BITRIX_WEBHOOK_URL, '/') : '';
-$GLOBALS['SUPPORT_URL']  = defined('ZIPTRON_SUPPORT_URL') ? ZIPTRON_SUPPORT_URL : 'https://t.me/ziptron_support_bot';
-$GLOBALS['SETUP_SECRET'] = defined('ZIPTRON_BOT_SETUP_SECRET') ? ZIPTRON_BOT_SETUP_SECRET : '';
-$GLOBALS['API']          = "https://api.telegram.org/bot{$GLOBALS['BOT_TOKEN']}";
+$S = is_file(__DIR__ . '/settings.php') ? (require __DIR__ . '/settings.php') : [];
+$GLOBALS['ADMIN_GROUP'] = $S['admin_group'] ?? 0;
+$GLOBALS['WORK_START']  = (int) ($S['work_start'] ?? 9);
+$GLOBALS['WORK_END']    = (int) ($S['work_end'] ?? 21);
+$GLOBALS['TZ']          = $S['timezone'] ?? 'Europe/Moscow';
 
-// --- низкоуровневый вызов Telegram API ---
-function api_call(string $method, array $params) {
+$GLOBALS['BOT_TOKEN'] = defined('ZIPTRON_BOT_TOKEN') ? ZIPTRON_BOT_TOKEN : '';
+$GLOBALS['BITRIX']    = defined('BITRIX_WEBHOOK_URL') ? rtrim((string) BITRIX_WEBHOOK_URL, '/') : '';
+$GLOBALS['API']       = "https://api.telegram.org/bot{$GLOBALS['BOT_TOKEN']}";
+
+// ---------- Telegram API ----------
+function tg(string $method, array $params): array {
     $ch = curl_init("{$GLOBALS['API']}/{$method}");
     curl_setopt_array($ch, [
-        CURLOPT_POST           => true,
-        CURLOPT_HTTPHEADER     => ['Content-Type: application/json'],
-        CURLOPT_POSTFIELDS     => json_encode($params, JSON_UNESCAPED_UNICODE),
+        CURLOPT_POST => true,
+        CURLOPT_HTTPHEADER => ['Content-Type: application/json'],
+        CURLOPT_POSTFIELDS => json_encode($params, JSON_UNESCAPED_UNICODE),
         CURLOPT_RETURNTRANSFER => true,
-        CURLOPT_TIMEOUT        => 30,
+        CURLOPT_TIMEOUT => 30,
     ]);
-    $res = curl_exec($ch);
-    return $res;
+    $r = curl_exec($ch);
+    $d = json_decode((string) $r, true);
+    return is_array($d) ? $d : [];
 }
-// getUpdates (для режима опроса)
 function tg_get_updates(int $offset, int $timeout) {
     $url = "{$GLOBALS['API']}/getUpdates?timeout={$timeout}&offset={$offset}&allowed_updates=" . urlencode('["message","callback_query"]');
     $ch = curl_init($url);
     curl_setopt_array($ch, [CURLOPT_RETURNTRANSFER => true, CURLOPT_TIMEOUT => $timeout + 15]);
-    $res = curl_exec($ch);
-    return json_decode((string) $res, true);
+    return json_decode((string) curl_exec($ch), true);
 }
+function send_msg($chat_id, string $text, ?array $inline = null): array {
+    $p = ['chat_id' => $chat_id, 'text' => $text, 'parse_mode' => 'HTML', 'disable_web_page_preview' => true];
+    if ($inline !== null) { $p['reply_markup'] = ['inline_keyboard' => $inline]; }
+    return tg('sendMessage', $p);
+}
+function esc(string $s): string { return htmlspecialchars($s, ENT_QUOTES | ENT_SUBSTITUTE, 'UTF-8'); }
 
-function send_menu($chat_id, string $text, array $inline) {
-    return api_call('sendMessage', [
-        'chat_id'      => $chat_id,
-        'text'         => $text,
-        'parse_mode'   => 'HTML',
-        'reply_markup' => ['inline_keyboard' => $inline],
-    ]);
-}
-function send_contact($chat_id, string $text) {
-    return api_call('sendMessage', [
-        'chat_id'      => $chat_id,
-        'text'         => $text,
-        'parse_mode'   => 'HTML',
-        'reply_markup' => [
-            'keyboard'          => [[['text' => '📱 Отправить мой номер', 'request_contact' => true]]],
-            'resize_keyboard'   => true,
-            'one_time_keyboard' => true,
-        ],
-    ]);
-}
+// ---------- состояние и связки (файлы) ----------
+function data_dir(): string { $d = __DIR__ . '/bot_data'; if (!is_dir($d)) { @mkdir($d, 0775, true); } return $d; }
+function k($id): string { return preg_replace('/[^0-9-]/', '', (string) $id); }
+function get_state($id): string { $f = data_dir() . '/state_' . k($id) . '.txt'; return is_file($f) ? trim((string) file_get_contents($f)) : ''; }
+function set_state($id, string $s): void { @file_put_contents(data_dir() . '/state_' . k($id) . '.txt', $s); }
+function clear_state($id): void { @unlink(data_dir() . '/state_' . k($id) . '.txt'); }
+// связка: id сообщения в группе -> chat_id клиента
+function relay_save(int $gmsg, $client): void { @file_put_contents(data_dir() . "/relay_{$gmsg}.txt", (string) $client); }
+function relay_lookup(int $gmsg): string { $f = data_dir() . "/relay_{$gmsg}.txt"; return is_file($f) ? trim((string) file_get_contents($f)) : ''; }
 
-// --- состояние диалога (файлы во временной папке) ---
-function state_file($chat_id): string {
-    $d = sys_get_temp_dir() . '/ziptron_bot_state';
-    if (!is_dir($d)) { @mkdir($d, 0775, true); }
-    if (!is_dir($d) || !is_writable($d)) { $d = __DIR__ . '/bot_data'; if (!is_dir($d)) { @mkdir($d, 0775, true); } }
-    return $d . '/' . preg_replace('/\D/', '', (string) $chat_id) . '.txt';
+function in_work_hours(): bool {
+    try {
+        $now = new DateTime('now', new DateTimeZone($GLOBALS['TZ']));
+        $h = (int) $now->format('G');
+        return $h >= $GLOBALS['WORK_START'] && $h < $GLOBALS['WORK_END'];
+    } catch (\Throwable $e) { return true; }
 }
-function get_state($chat_id): string { $f = state_file($chat_id); return is_file($f) ? trim((string) file_get_contents($f)) : ''; }
-function set_state($chat_id, string $s): void { @file_put_contents(state_file($chat_id), $s); }
-function clear_state($chat_id): void { @unlink(state_file($chat_id)); }
 
 function main_menu(): array {
     return [
-        [['text' => '🔥 Горячая линия',     'callback_data' => 'hotline']],
-        [['text' => '🛠 Техподдержка',       'callback_data' => 'support']],
-        [['text' => '📝 Заявка на аренду',   'callback_data' => 'rent']],
-        [['text' => '⚖️ Юридическая помощь', 'callback_data' => 'legal']],
+        [['text' => '🛵 Оформить аренду',        'callback_data' => 'rent']],
+        [['text' => '🛠 Техподдержка',            'callback_data' => 'support']],
+        [['text' => '📞 Связаться с менеджером',  'callback_data' => 'hotline']],
+        [['text' => '⚖️ Юридический вопрос',      'callback_data' => 'legal']],
     ];
 }
-function support_menu(): array {
+function city_kb(string $topic): array {
     return [
-        [['text' => '⚠️ Поломка в дороге',  'callback_data' => 'breakdown']],
-        [['text' => '🔧 Записаться на ТО',   'callback_data' => 'service']],
-        [['text' => '⬅️ Назад',              'callback_data' => 'back']],
+        [['text' => 'Москва', 'callback_data' => "city:{$topic}:Москва"], ['text' => 'Ростов-на-Дону', 'callback_data' => "city:{$topic}:Ростов-на-Дону"]],
+        [['text' => '⬅️ В меню', 'callback_data' => 'back']],
     ];
+}
+function topic_label(string $t): string {
+    $m = ['breakdown' => '⚠️ Поломка в дороге', 'service' => '🔧 Запись на ТО', 'manager' => '📞 Менеджер', 'legal' => '⚖️ Юр. вопрос'];
+    return $m[$t] ?? $t;
 }
 
 function create_lead(string $title, string $name, string $comment, string $phone = ''): void {
     $BITRIX = $GLOBALS['BITRIX'];
     if ($BITRIX === '') { error_log('[bot] BITRIX_WEBHOOK_URL не задан'); return; }
-    $fields = [
-        'TITLE'              => $title,
-        'NAME'               => $name !== '' ? $name : 'Клиент из Telegram',
-        'SOURCE_ID'          => 'TELEGRAM',
-        'SOURCE_DESCRIPTION' => 'Бот @ziptron_rent_bot',
-        'COMMENTS'           => $comment,
-        'OPENED'             => 'Y',
-    ];
+    $fields = ['TITLE' => $title, 'NAME' => $name !== '' ? $name : 'Клиент из Telegram',
+        'SOURCE_ID' => 'TELEGRAM', 'SOURCE_DESCRIPTION' => 'Бот @ziptron_rent_bot', 'COMMENTS' => $comment, 'OPENED' => 'Y'];
     if ($phone !== '') { $fields['PHONE'] = [['VALUE' => $phone, 'VALUE_TYPE' => 'MOBILE']]; }
     $ch = curl_init("{$BITRIX}/crm.lead.add.json");
-    curl_setopt_array($ch, [
-        CURLOPT_POST           => true,
-        CURLOPT_HTTPHEADER     => ['Content-Type: application/json'],
-        CURLOPT_POSTFIELDS     => json_encode(['fields' => $fields, 'params' => ['REGISTER_SONET_EVENT' => 'Y']], JSON_UNESCAPED_UNICODE),
-        CURLOPT_RETURNTRANSFER => true,
-        CURLOPT_TIMEOUT        => 15,
-    ]);
-    $body = curl_exec($ch);
-    $code = curl_getinfo($ch, CURLINFO_HTTP_CODE);
+    curl_setopt_array($ch, [CURLOPT_POST => true, CURLOPT_HTTPHEADER => ['Content-Type: application/json'],
+        CURLOPT_POSTFIELDS => json_encode(['fields' => $fields, 'params' => ['REGISTER_SONET_EVENT' => 'Y']], JSON_UNESCAPED_UNICODE),
+        CURLOPT_RETURNTRANSFER => true, CURLOPT_TIMEOUT => 15]);
+    $body = curl_exec($ch); $code = curl_getinfo($ch, CURLINFO_HTTP_CODE);
     if ($code < 200 || $code >= 300) { error_log("[bot] Bitrix lead error {$code}: {$body}"); }
 }
 
-// ================= обработка одного апдейта =================
-function handle_update(array $update): void {
-    $SUPPORT_URL = $GLOBALS['SUPPORT_URL'];
+// ================= обработка апдейта =================
+function handle_update(array $u): void {
+    $AG = $GLOBALS['ADMIN_GROUP'];
 
-    // ----- нажатие кнопки -----
-    if (isset($update['callback_query'])) {
-        $cq      = $update['callback_query'];
-        $chat_id = $cq['message']['chat']['id'];
-        $data    = $cq['data'] ?? '';
-        api_call('answerCallbackQuery', ['callback_query_id' => $cq['id']]);
+    // ----- кнопки -----
+    if (isset($u['callback_query'])) {
+        $cq = $u['callback_query'];
+        $chat = $cq['message']['chat']['id'];
+        $data = $cq['data'] ?? '';
+        $name = trim(((string) ($cq['from']['first_name'] ?? '')) . ' ' . ((string) ($cq['from']['last_name'] ?? '')));
+        tg('answerCallbackQuery', ['callback_query_id' => $cq['id']]);
 
-        switch ($data) {
-            case 'hotline':
-                send_menu($chat_id, "Нажмите кнопку ниже — откроется чат с оператором, ответим вживую 👇", [
-                    [['text' => '💬 Написать оператору', 'url' => $SUPPORT_URL]],
-                    [['text' => '⬅️ В меню', 'callback_data' => 'back']],
-                ]);
-                break;
-            case 'support':
-                send_menu($chat_id, "🛠 <b>Техподдержка</b>\nЧто случилось? Выберите 👇", support_menu());
-                break;
-            case 'breakdown':
-                set_state($chat_id, 'await_breakdown');
-                send_menu($chat_id, "⚠️ Опишите, пожалуйста, одним сообщением:\n① что случилось\n② где вы (адрес/район)\n\nСразу передам сотрудникам — это срочно.", [[['text' => '⬅️ Назад', 'callback_data' => 'back']]]);
-                break;
-            case 'service':
-                set_state($chat_id, 'await_service');
-                send_contact($chat_id, "🔧 <b>Запись на ТО</b>\nОтправьте номер кнопкой ниже (или впишите вручную) и удобные дату/время — мастер свяжется и подтвердит.");
-                break;
-            case 'rent':
-                set_state($chat_id, 'await_rent');
-                send_contact($chat_id, "📝 Отлично! Оставьте номер — нажмите кнопку ниже или впишите вручную. Менеджер свяжется и подберёт байк. 📞");
-                break;
-            case 'legal':
-                set_state($chat_id, 'await_legal');
-                send_menu($chat_id, "⚖️ Опишите кратко ваш вопрос — передадим юристу, он свяжется с вами.", [[['text' => '⬅️ Назад', 'callback_data' => 'back']]]);
-                break;
-            case 'back':
-            default:
-                clear_state($chat_id);
-                send_menu($chat_id, "Чем помочь? Выберите 👇", main_menu());
-                break;
+        if ($data === 'rent') {
+            set_state($chat, 'rent');
+            send_msg($chat, "🛵 <b>Оформить аренду</b>\nНапишите, пожалуйста, ваш номер телефона — менеджер свяжется и подберёт байк. 📞");
+            return;
         }
+        if ($data === 'support') {
+            send_msg($chat, "🛠 <b>Техподдержка</b>\nЧто случилось?", [
+                [['text' => '⚠️ Поломка в дороге', 'callback_data' => 't:breakdown']],
+                [['text' => '🔧 Записаться на ТО',  'callback_data' => 't:service']],
+                [['text' => '⬅️ В меню',            'callback_data' => 'back']],
+            ]);
+            return;
+        }
+        if ($data === 'hotline') { send_msg($chat, "📞 <b>Связь с менеджером</b>\nВыберите ваш город:", city_kb('manager')); return; }
+        if ($data === 'legal')   { send_msg($chat, "⚖️ <b>Юридический вопрос</b>\nВыберите ваш город:", city_kb('legal')); return; }
+        if (strpos($data, 't:') === 0) { $topic = substr($data, 2); send_msg($chat, topic_label($topic) . "\nВыберите ваш город:", city_kb($topic)); return; }
+
+        if (strpos($data, 'city:') === 0) {
+            $parts = explode(':', $data, 3);
+            $topic = $parts[1] ?? 'manager';
+            $city  = $parts[2] ?? '';
+            set_state($chat, "support|{$topic}|{$city}");
+            if (in_work_hours()) {
+                send_msg($chat, "Спасибо, что обратились! 👋 Менеджер сейчас подключится.\nПока опишите, пожалуйста, что у вас случилось — пишите прямо сюда ✍️");
+            } else {
+                $ws = $GLOBALS['WORK_START']; $we = $GLOBALS['WORK_END'];
+                send_msg($chat, "Извините за ожидание 🙏 Мы работаем с {$ws}:00 до {$we}:00.\nВаше обращение уже передано — менеджер свяжется с вами завтра с {$ws}:00 утра. Постараемся решить ваш вопрос максимально оперативно. Спасибо за понимание! 🙌\n\nМожете уже описать вопрос — он будет ждать менеджера.");
+            }
+            if ($AG) {
+                $moon = in_work_hours() ? '' : ' 🌙 вне часов';
+                tg('sendMessage', ['chat_id' => $AG, 'parse_mode' => 'HTML',
+                    'text' => "🆕 <b>Новое обращение</b>{$moon}\n" . topic_label($topic) . " · 🏙 " . esc($city) . "\n👤 " . esc($name) . "\n\nКлиент сейчас опишет вопрос — отвечайте <b>reply</b> на его сообщения 👇"]);
+            }
+            return;
+        }
+
+        clear_state($chat);
+        send_msg($chat, "Чем помочь? Выберите 👇", main_menu());
         return;
     }
 
-    // ----- сообщение -----
-    if (isset($update['message'])) {
-        $m       = $update['message'];
-        $chat_id = $m['chat']['id'];
-        $text    = trim((string) ($m['text'] ?? ''));
-        $name    = trim(((string) ($m['from']['first_name'] ?? '')) . ' ' . ((string) ($m['from']['last_name'] ?? '')));
-        $phone   = isset($m['contact']['phone_number']) ? (string) $m['contact']['phone_number'] : '';
+    // ----- сообщения -----
+    if (isset($u['message'])) {
+        $m = $u['message'];
+        $chat = $m['chat']['id'];
+        $text = trim((string) ($m['text'] ?? ''));
+        $name = trim(((string) ($m['from']['first_name'] ?? '')) . ' ' . ((string) ($m['from']['last_name'] ?? '')));
 
         if ($text === '/chatid') {
-            api_call('sendMessage', ['chat_id' => $chat_id, 'text' => "ID этого чата: <code>{$chat_id}</code>", 'parse_mode' => 'HTML']);
+            tg('sendMessage', ['chat_id' => $chat, 'text' => "ID этого чата: <code>{$chat}</code>", 'parse_mode' => 'HTML']);
             return;
         }
 
-        if ($text === '/start') {
-            clear_state($chat_id);
-            send_menu($chat_id, "Здравствуйте! 👋 Это <b>Ziptron</b> — аренда грузовых электробайков.\nЧем помочь? Выберите кнопку ниже 👇", main_menu());
-            return;
-        }
-
-        $state = get_state($chat_id);
-        if ($state !== '') {
-            $maybePhone = $phone;
-            if ($maybePhone === '' && preg_match('/[\d\+][\d\-\s\(\)]{9,}/', $text, $mm)) { $maybePhone = $mm[0]; }
-            $detail = $text !== '' ? $text : ('Телефон: ' . $maybePhone);
-
-            if ($state === 'await_breakdown') {
-                create_lead("🔥 ПОЛОМКА в дороге — {$name}", $name, "СРОЧНО, поломка:\n{$detail}", $maybePhone);
-                api_call('sendMessage', ['chat_id' => $chat_id, 'text' => "Принято! ⚡ Передал сотрудникам — с вами свяжутся как можно скорее.", 'reply_markup' => ['remove_keyboard' => true]]);
-            } elseif ($state === 'await_service') {
-                create_lead("🔧 Запись на ТО — {$name}", $name, "Запись на ТО:\n{$detail}", $maybePhone);
-                api_call('sendMessage', ['chat_id' => $chat_id, 'text' => "Спасибо! 🔧 Заявка на ТО принята — мастер свяжется и подтвердит время.", 'reply_markup' => ['remove_keyboard' => true]]);
-            } elseif ($state === 'await_rent') {
-                create_lead("📝 Аренда (бот) — {$name}", $name, "Заявка на аренду:\n{$detail}", $maybePhone);
-                api_call('sendMessage', ['chat_id' => $chat_id, 'text' => "Спасибо! 📞 Менеджер скоро свяжется и подберёт байк.", 'reply_markup' => ['remove_keyboard' => true]]);
-            } elseif ($state === 'await_legal') {
-                create_lead("⚖️ Юр. вопрос — {$name}", $name, "Юридический вопрос:\n{$detail}", $maybePhone);
-                api_call('sendMessage', ['chat_id' => $chat_id, 'text' => "Спасибо! ⚖️ Передал юристу — с вами свяжутся.", 'reply_markup' => ['remove_keyboard' => true]]);
+        // --- сообщения в админ-группе: ответ админа (reply) -> клиенту ---
+        if ($AG && (string) $chat === (string) $AG) {
+            if (isset($m['reply_to_message']) && $text !== '') {
+                $client = relay_lookup((int) $m['reply_to_message']['message_id']);
+                if ($client !== '') {
+                    send_msg($client, "💬 <b>Менеджер:</b> " . esc($text));
+                    tg('sendMessage', ['chat_id' => $AG, 'reply_to_message_id' => $m['message_id'], 'text' => '✅ отправлено клиенту']);
+                }
             }
-            clear_state($chat_id);
-            send_menu($chat_id, "Чем ещё помочь? 👇", main_menu());
             return;
         }
 
-        // любое другое сообщение → показать меню
-        send_menu($chat_id, "Здравствуйте! 👋 Выберите, чем помочь 👇", main_menu());
+        // --- личный чат клиента ---
+        if ($text === '/start') {
+            clear_state($chat);
+            send_msg($chat, "Здравствуйте! 👋 Это <b>Ziptron</b> — аренда грузовых электробайков.\nЧем помочь? Выберите кнопку ниже 👇", main_menu());
+            return;
+        }
+
+        $st = get_state($chat);
+
+        if ($st === 'rent') {
+            $phone = isset($m['contact']['phone_number']) ? (string) $m['contact']['phone_number'] : '';
+            if ($phone === '' && preg_match('/[\d\+][\d\-\s\(\)]{9,}/', $text, $mm)) { $phone = $mm[0]; }
+            create_lead("📝 Аренда (бот) — {$name}", $name, "Заявка на аренду из бота:\n" . ($text !== '' ? $text : $phone), $phone);
+            clear_state($chat);
+            send_msg($chat, "Спасибо! 📞 Заявка принята — менеджер скоро свяжется и подберёт байк.", main_menu());
+            return;
+        }
+
+        if (strpos($st, 'support|') === 0) {
+            $parts = explode('|', $st, 3);
+            $topic = $parts[1] ?? 'manager';
+            $city  = $parts[2] ?? '';
+            if ($AG && $text !== '') {
+                $r = tg('sendMessage', ['chat_id' => $AG, 'parse_mode' => 'HTML',
+                    'text' => "👤 <b>" . esc($name) . "</b> · " . topic_label($topic) . " · 🏙 " . esc($city) . "\n\n" . esc($text) . "\n\n↩️ <i>Reply — ответить клиенту</i>"]);
+                $gmsg = $r['result']['message_id'] ?? 0;
+                if ($gmsg) { relay_save((int) $gmsg, $chat); }
+            }
+            return;
+        }
+
+        send_msg($chat, "Здравствуйте! 👋 Выберите, чем помочь 👇", main_menu());
         return;
     }
 }

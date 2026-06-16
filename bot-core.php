@@ -163,6 +163,11 @@ function handle_update(array $update): void {
         $name    = trim(((string) ($m['from']['first_name'] ?? '')) . ' ' . ((string) ($m['from']['last_name'] ?? '')));
         $phone   = isset($m['contact']['phone_number']) ? (string) $m['contact']['phone_number'] : '';
 
+        if ($text === '/chatid') {
+            api_call('sendMessage', ['chat_id' => $chat_id, 'text' => "ID этого чата: <code>{$chat_id}</code>", 'parse_mode' => 'HTML']);
+            return;
+        }
+
         if ($text === '/start') {
             clear_state($chat_id);
             send_menu($chat_id, "Здравствуйте! 👋 Это <b>Ziptron</b> — аренда грузовых электробайков.\nЧем помочь? Выберите кнопку ниже 👇", main_menu());

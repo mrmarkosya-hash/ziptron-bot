@@ -1,0 +1,8 @@
+[Unit]
+Description=Ziptron bot auto-update (git pull + restart)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/bin/sh /opt/ziptronbot/update.sh

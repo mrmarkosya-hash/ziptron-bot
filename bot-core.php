@@ -14,6 +14,7 @@ $GLOBALS['WORK_START']  = (int) ($S['work_start'] ?? 9);
 $GLOBALS['WORK_END']    = (int) ($S['work_end'] ?? 21);
 $GLOBALS['TZ']          = $S['timezone'] ?? 'Europe/Moscow';
 $GLOBALS['TO_URL']      = $S['to_booking_url'] ?? '';
+$GLOBALS['SUPPORT_URL'] = defined('ZIPTRON_SUPPORT_URL') ? ZIPTRON_SUPPORT_URL : 'https://t.me/ziptron_support_bot';
 
 $GLOBALS['BOT_TOKEN'] = defined('ZIPTRON_BOT_TOKEN') ? ZIPTRON_BOT_TOKEN : '';
 $GLOBALS['BITRIX']    = defined('BITRIX_WEBHOOK_URL') ? rtrim((string) BITRIX_WEBHOOK_URL, '/') : '';
@@ -146,8 +147,12 @@ function handle_update(array $u): void {
         tg('answerCallbackQuery', ['callback_query_id' => $cq['id']]);
 
         if ($data === 'rent') {
-            set_state($chat, 'rent');
-            send_msg($chat, "🛵 <b>Оформить аренду</b>\nНапишите ваш номер телефона — менеджер свяжется с вами и поможет оформить аренду 📞");
+            clear_state($chat);
+            $surl = $GLOBALS['SUPPORT_URL'];
+            send_msg($chat, "🛵 <b>Оформить аренду</b>\nОформление аренды ведёт наш основной бот — там менеджер подберёт байк, расскажет условия и оформит аренду. Нажмите кнопку ниже 👇", [
+                [['text' => '🛵 Перейти к оформлению', 'url' => $surl]],
+                [['text' => '⬅️ В меню', 'callback_data' => 'back']],
+            ]);
             return;
         }
         if ($data === 'support') { send_msg($chat, "🛠 <b>Техподдержка</b>\nЧто случилось?", support_menu()); return; }

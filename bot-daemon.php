@@ -11,7 +11,7 @@ if ($GLOBALS['BOT_TOKEN'] === '') { fwrite(STDERR, "Нет токена в bot-c
 $offFile = __DIR__ . '/bot_offset.txt';
 $offset  = is_file($offFile) ? (int) file_get_contents($offFile) : 0;
 
-fwrite(STDERR, "Ziptron bot daemon started (offset {$offset})\n");
+fwrite(STDERR, "Ziptron bot daemon started (clean) (offset {$offset})\n");
 
 while (true) {
     $resp = tg_get_updates($offset, 30);   // long-poll 30 сек — ответ приходит мгновенно при сообщении

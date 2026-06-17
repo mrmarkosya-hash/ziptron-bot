@@ -8,5 +8,7 @@ WorkingDirectory=/opt/ziptronbot
 ExecStart=/usr/bin/php /opt/ziptronbot/bot-daemon.php
 Restart=always
 RestartSec=3
+TimeoutStopSec=10
+KillMode=mixed
 [Install]
 WantedBy=multi-user.target

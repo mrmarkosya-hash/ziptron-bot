@@ -211,6 +211,17 @@ function handle_update(array $u): void {
 
         if ($text === '/chatid') { tg('sendMessage', ['chat_id' => $chat, 'text' => "ID этого чата: <code>{$chat}</code>", 'parse_mode' => 'HTML']); return; }
 
+        if ($text === '/health') {
+            $b   = is_file(data_dir() . '/boots.txt')      ? (int) file_get_contents(data_dir() . '/boots.txt')      : 0;
+            $st  = is_file(data_dir() . '/started_at.txt') ? (int) file_get_contents(data_dir() . '/started_at.txt') : 0;
+            $hb  = is_file(data_dir() . '/heartbeat.txt')  ? (int) file_get_contents(data_dir() . '/heartbeat.txt')  : 0;
+            $up  = $st ? (time() - $st) : -1;
+            $age = $hb ? (time() - $hb) : -1;
+            tg('sendMessage', ['chat_id' => $chat, 'parse_mode' => 'HTML',
+                'text' => "🩺 <b>Статус бота</b>\nРаботает без перезапуска: <b>{$up} сек</b>\nВсего запусков: <b>{$b}</b>\nПоследний цикл опроса: <b>{$age} сек назад</b>"]);
+            return;
+        }
+
         // админ-группа: reply админа -> клиенту
         if ($AG && (string) $chat === (string) $AG) {
             if (isset($m['reply_to_message']) && $text !== '') {

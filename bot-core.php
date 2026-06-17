@@ -55,10 +55,9 @@ function in_work_hours(): bool {
 
 function main_menu(): array {
     return [
-        [['text' => '🛵 Оформить аренду',       'callback_data' => 'rent']],
-        [['text' => '🛠 Техподдержка',           'callback_data' => 'support']],
-        [['text' => '📞 Связаться с менеджером', 'callback_data' => 'hotline']],
-        [['text' => '⚖️ Юридический вопрос',     'callback_data' => 'legal']],
+        [['text' => '🛵 Оформить аренду',   'callback_data' => 'rent']],
+        [['text' => '🛠 Техподдержка',       'callback_data' => 'support']],
+        [['text' => '⚖️ Юридический вопрос', 'callback_data' => 'legal']],
     ];
 }
 function support_menu(): array {
@@ -152,7 +151,6 @@ function handle_update(array $u): void {
             return;
         }
         if ($data === 'support') { send_msg($chat, "🛠 <b>Техподдержка</b>\nЧто случилось?", support_menu()); return; }
-        if ($data === 'hotline') { send_msg($chat, "📞 <b>Связаться с менеджером</b>\nВыберите ваш город:", city_kb('manager')); return; }
         if ($data === 'legal')   { send_msg($chat, "⚖️ <b>Юридический вопрос</b>\nВыберите ваш город:", city_kb('legal')); return; }
         if ($data === 'to') {
             $url = $GLOBALS['TO_URL'];
